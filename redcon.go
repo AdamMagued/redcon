@@ -3,6 +3,7 @@ package redcon
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -19,6 +21,7 @@ import (
 )
 
 var (
+	ErrReusePortNotSupported  = errors.New("redcon: reuseport is not supported on this platform")
 	errUnbalancedQuotes       = &errProtocol{"unbalanced quotes in request"}
 	errInvalidBulkLength      = &errProtocol{"invalid bulk length"}
 	errInvalidMultiBulkLength = &errProtocol{"invalid multibulk length"}
@@ -292,10 +295,41 @@ func ListenAndServeNetworkTLS(
 	return NewServerNetworkTLS(net, laddr, handler, accept, closed, config).ListenAndServe()
 }
 
+// Listen creates a net.Listener using Server configuration.
+func (s *Server) Listen() (net.Listener, error) {
+	s.mu.Lock()
+	network := s.net
+	laddr := s.laddr
+	lc := s.ListenConfig
+	reusePort := s.ReusePort
+	s.mu.Unlock()
+
+	if lc == nil && !reusePort {
+		return net.Listen(network, laddr)
+	}
+
+	var config net.ListenConfig
+	if lc != nil {
+		config = *lc
+	}
+	if reusePort {
+		userControl := config.Control
+		config.Control = func(network, address string, c syscall.RawConn) error {
+			if userControl != nil {
+				if err := userControl(network, address, c); err != nil {
+					return err
+				}
+			}
+			return reusePortControl(network, address, c)
+		}
+	}
+	return config.Listen(context.Background(), network, laddr)
+}
+
 // ListenServeAndSignal serves incoming connections and passes nil or error
 // when listening. signal can be nil.
 func (s *Server) ListenServeAndSignal(signal chan error) error {
-	ln, err := net.Listen(s.net, s.laddr)
+	ln, err := s.Listen()
 	if err != nil {
 		if signal != nil {
 			signal <- err
@@ -321,10 +355,26 @@ func (s *Server) Serve(ln net.Listener) error {
 	return serve(s)
 }
 
+// Listen creates a net.Listener with TLS using TLSServer configuration.
+func (s *TLSServer) Listen() (net.Listener, error) {
+	s.mu.Lock()
+	hasCustom := s.ListenConfig != nil || s.ReusePort
+	s.mu.Unlock()
+
+	if !hasCustom {
+		return tls.Listen(s.net, s.laddr, s.config)
+	}
+	ln, err := s.Server.Listen()
+	if err != nil {
+		return nil, err
+	}
+	return tls.NewListener(ln, s.config), nil
+}
+
 // ListenServeAndSignal serves incoming connections and passes nil or error
 // when listening. signal can be nil.
 func (s *TLSServer) ListenServeAndSignal(signal chan error) error {
-	ln, err := tls.Listen(s.net, s.laddr, s.config)
+	ln, err := s.Listen()
 	if err != nil {
 		if signal != nil {
 			signal <- err
@@ -583,6 +633,13 @@ type Server struct {
 
 	// AcceptError is an optional function used to handle Accept errors.
 	AcceptError func(err error)
+
+	// ListenConfig is an optional net.ListenConfig used when creating the listener.
+	ListenConfig *net.ListenConfig
+
+	// ReusePort enables SO_REUSEPORT socket option when creating the listener
+	// on supported platforms.
+	ReusePort bool
 }
 
 // TLSServer defines a server for clients for managing client connections.
@@ -1442,5 +1499,19 @@ func (ps *PubSub) unsubscribe(conn Conn, pattern, all bool, channel string) {
 func (s *Server) SetIdleClose(dur time.Duration) {
 	s.mu.Lock()
 	s.idleClose = dur
+	s.mu.Unlock()
+}
+
+// SetReusePort enables or disables SO_REUSEPORT socket option when creating the listener.
+func (s *Server) SetReusePort(reusePort bool) {
+	s.mu.Lock()
+	s.ReusePort = reusePort
+	s.mu.Unlock()
+}
+
+// SetListenConfig sets the net.ListenConfig used when creating the listener.
+func (s *Server) SetListenConfig(config *net.ListenConfig) {
+	s.mu.Lock()
+	s.ListenConfig = config
 	s.mu.Unlock()
 }
